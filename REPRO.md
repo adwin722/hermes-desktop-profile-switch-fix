@@ -1,5 +1,10 @@
 # Reproducing the bug (before the patch)
 
+> 中文速览：两份 profile（一个 50 条会话、一个 29 条，数量差得越大越好）→ 左下角切换 profile → **别发消息**，
+> 盯侧栏 5 秒。坏版：旧 profile 的会话条一直挂着（4~8 秒，直到后台拨号完成），分组视图更久、要手动刷新，
+> 而且这期间旧会话还能点开。好版：点击瞬间列表清空 + 加载骨架，旧行不再出现，随后自动填入新 profile 的列表。
+> 同一时刻只允许开一个 Hermes 实例（两个会抢 userData 和网关端口）。
+
 Goal: see the previous profile's sessions stay in the sidebar after a profile switch, on an unpatched build.
 
 ## Setup

@@ -1,5 +1,16 @@
 # 根因：切 profile 后「旧会话先出现几秒」的四个叠加缺陷
 
+> **English summary** — Switching profile in the Hermes desktop sidebar showed the *outgoing* profile's
+> session rows for 2–8 s (as long as `hermes gateway ensure` dials), and in the grouped "all projects" view
+> until a manual Refresh. It is not one bug but four stacked ones: (1) the pick starts a dial without clearing
+> the UI (`gateway-switch.ts` `beginProfileSwitch()`); (2) nothing re-pulls the list when the profile scope
+> finally moves (`wiring-effects.ts` `useGatewayScopeRefresh()`); (3) activating a shared primary socket
+> announced route `default`, mirroring `$activeGatewayProfile` back to the default profile (`gateway.ts`
+> `applyActive(profile, epoch, servedProfile?)`); (4) the grouped sidebar renders `$projectTree`, not
+> `$sessions`, so wiping the session list left the outgoing profile's project rows painted
+> (`projects.ts` `resetProjectsForProfileSwitch()`). The patch fixes all four; the two new test files fail on
+> the unpatched tree.
+
 本文只写：问题是什么、怎么定出来的、改了什么。面向想理解补丁内部结构或想在上游修同样问题的人。
 所有路径相对 `apps/desktop/src`。
 
