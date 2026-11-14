@@ -8,6 +8,12 @@
 
 [中文说明见下方](#中文说明)
 
+This is **not a cosmetic glitch**. Picking a profile is how you hand a task to the right agent. When the
+sidebar keeps the outgoing agent's sessions, you open the new session — or resume an old one — in the
+**wrong agent**, and the work lands on the wrong role. Silently: nothing on screen tells you that you are
+still sitting in the previous agent. The patch restores one rule: *what you see after a pick must already
+belong to the agent you picked.*
+
 ## Symptoms this fixes
 
 | Symptom you may have searched for | Before | After |
@@ -19,7 +25,27 @@
 
 Keywords: `hermes-agent` · `hermes desktop` · `profile switch` · `profile switcher` · `stale sessions` ·
 `old sessions` · `wrong sessions` · `session list not refreshing` · `multi-profile` · `sidebar` ·
-`electron` · `react` · `nanostores` · `gateway`
+`electron` · `react` · `nanostores` · `gateway` · `wrong agent` · `task routed to the wrong profile` ·
+`responsibility pollution` · `context pollution` · `multi-agent workflow` · `agent routing`
+
+## Wrong agent, wrong task: responsibility and context pollution
+
+In multi-agent use the sidebar **is** the routing UI — it is how a task gets handed to the role that should
+own it. A stale list therefore does not just look wrong, it *routes* wrong:
+
+- **Wrong agent, wrong session.** You pick agent B to open a session for job X, but the list still shows
+  agent A's sessions. The new session is created under A, or you resume one of A's sessions thinking it is
+  B's.
+- **Responsibility pollution.** The work lands on a role that was never meant to own it. Later nobody can
+  say which agent did what, and the right agent never saw the task at all.
+- **Context pollution.** That session now mixes two mandates. The next agent (or the next you) reads a
+  history that carries another role's background — decisions get made on contaminated context.
+- **No brake.** During the 2–8 s dial the stale rows stay *clickable*, so nothing forces you to wait for the
+  list to settle. One fast click is enough.
+
+Anyone coming from a multi-agent setup searches for the consequence rather than the symptom: `task sent to
+wrong agent`, `opened session in wrong profile`, `agent role confusion`, `context pollution between agents`,
+`mix up which agent did what`. That is what this patch is really about.
 
 ## Before / after (recorded 2026-11-14)
 
@@ -96,6 +122,20 @@ If your upstream tree has diverged, conflicts concentrate in
 - MIT, same as upstream. Hermes Agent is © 2025 Nous Research; this patch only adds to it.
 
 ## 中文说明
+
+### 为什么会把活派错 agent（职责越界 / 上下文污染）
+
+切 profile 说白了就是"换人干活"。列表还挂着**上一个 agent** 的会话时，你照着它去开新会话、去翻历史会话，
+会话就开在了错的 agent 里；活派下去，接手的是**不该负责这件事的那个角色**——该干的没干，不该干的干了，
+事后还分不清是谁做的。这就是**职责越界**。
+
+同一份会话里还会混进两套职责的背景，即**上下文污染**：下一个接手的人（或下一个 agent）读到的是掺过的历史，
+等于踩在脏地基上继续盖楼。
+
+最坑的是它**不吭声**：屏幕上没有一句提示告诉你"其实还在上一个 agent 里"；而且切换途中的那 4~8 秒，
+旧会话**还能点开**，手快一点直接就进去了，连"等一下"的机会都不给。
+
+修完的规则只有一条：**点完切过去，屏幕上看到的东西就该是你切过去那个 agent 的。**
 
 **这段解决什么麻烦**：Hermes 桌面版左下角切 profile（换账号 / 换身份）之后，会话列表还显示**上一个
 profile 的会话**，要等几秒才变对，有时必须右键手动刷新。打完这个补丁：点击瞬间列表清空并显示加载状态，

@@ -9,7 +9,9 @@
 > `applyActive(profile, epoch, servedProfile?)`); (4) the grouped sidebar renders `$projectTree`, not
 > `$sessions`, so wiping the session list left the outgoing profile's project rows painted
 > (`projects.ts` `resetProjectsForProfileSwitch()`). The patch fixes all four; the two new test files fail on
-> the unpatched tree.
+> the unpatched tree. The user-visible cost is not the flicker: in multi-agent use the stale rows route a
+> task to the **wrong agent**, so the work and its context end up on the wrong role (responsibility and
+> context pollution), and during the dial the stale rows stay clickable, so nothing forces a wait.
 
 本文只写：问题是什么、怎么定出来的、改了什么。面向想理解补丁内部结构或想在上游修同样问题的人。
 所有路径相对 `apps/desktop/src`。
