@@ -1,0 +1,1473 @@
+From d7afb1ff79e1945f0cd271409ad19bafcaa94306 Mon Sep 17 00:00:00 2001
+From: adwin722 <153172773+adwin722@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 14:43:31 +0800
+Subject: [PATCH] fix(desktop): profile switch clears the outgoing profile's
+ rows and repaints the target's
+
+---
+ apps/desktop/src/app/chat/sidebar/index.tsx   |   1 +
+ .../profile-dropdown-switcher.test.tsx        |   1 +
+ .../sidebar/profile-dropdown-switcher.tsx     |  16 +-
+ .../sidebar/profile-menu-unserved.test.tsx    |   1 +
+ .../sidebar/profile-rail-connect.test.tsx     |   1 +
+ .../chat/sidebar/profile-rail-fleet.test.tsx  |   1 +
+ .../chat/sidebar/profile-rail-status.test.tsx |   1 +
+ .../src/app/chat/sidebar/profile-switcher.tsx |  15 +-
+ ...ing-effects.gateway-scope-refresh.test.tsx | 117 ++++++++++++++
+ .../desktop/src/app/contrib/wiring-effects.ts |  25 ++-
+ apps/desktop/src/app/contrib/wiring.tsx       |   2 +-
+ .../hooks/use-session-actions/index.ts        |  11 ++
+ .../hooks/use-session-list-actions.test.tsx   | 144 ++++++++++++++----
+ .../session/hooks/use-session-list-actions.ts |  53 ++++++-
+ apps/desktop/src/store/gateway-switch.ts      |  55 ++++++-
+ apps/desktop/src/store/gateway.test.ts        |  31 ++++
+ apps/desktop/src/store/gateway.ts             |  27 +++-
+ .../profile-select-webapp-served.test.ts      |   5 +-
+ .../src/store/profile-switch-barrier.test.ts  | 130 ++++++++++++++++
+ apps/desktop/src/store/profile.ts             |  60 ++++++++
+ apps/desktop/src/store/projects.ts            |  15 ++
+ .../desktop/src/store/reactions-local.test.ts |   2 +
+ 22 files changed, 664 insertions(+), 50 deletions(-)
+ create mode 100644 apps/desktop/src/app/contrib/wiring-effects.gateway-scope-refresh.test.tsx
+ create mode 100644 apps/desktop/src/store/profile-switch-barrier.test.ts
+
+diff --git a/apps/desktop/src/app/chat/sidebar/index.tsx b/apps/desktop/src/app/chat/sidebar/index.tsx
+index 187019389a..4b17e31627 100644
+--- a/apps/desktop/src/app/chat/sidebar/index.tsx
++++ b/apps/desktop/src/app/chat/sidebar/index.tsx
+@@ -487,6 +487,7 @@ export function ChatSidebar({
+   const focusedSessionIsTile = useStore($focusedSessionIsTile)
+   const currentView = focusedSessionIsTile ? 'chat' : routeView
+   const sessions = useStore($sessions)
++
+   const cronSessions = useStore($cronSessions)
+   const cronJobs = useStore($cronJobs)
+   const messagingSessions = useStore($messagingSessions)
+diff --git a/apps/desktop/src/app/chat/sidebar/profile-dropdown-switcher.test.tsx b/apps/desktop/src/app/chat/sidebar/profile-dropdown-switcher.test.tsx
+index 47f2f00529..4983b385bf 100644
+--- a/apps/desktop/src/app/chat/sidebar/profile-dropdown-switcher.test.tsx
++++ b/apps/desktop/src/app/chat/sidebar/profile-dropdown-switcher.test.tsx
+@@ -38,6 +38,7 @@ vi.mock('@/store/profile', () => ({
+   $profileColors: atom({}),
+   $profileCreateRequest: atom(0),
+   $profileOrder: atom([]),
++  $profileSwitchTarget: atom<null | string>(null),
+   $profiles: atom([
+     { is_default: true, name: 'default' },
+     { is_default: false, name: 'clippy' }
+diff --git a/apps/desktop/src/app/chat/sidebar/profile-dropdown-switcher.tsx b/apps/desktop/src/app/chat/sidebar/profile-dropdown-switcher.tsx
+index c2b77eaa7b..22a36ed9a5 100644
+--- a/apps/desktop/src/app/chat/sidebar/profile-dropdown-switcher.tsx
++++ b/apps/desktop/src/app/chat/sidebar/profile-dropdown-switcher.tsx
+@@ -35,6 +35,7 @@ import {
+   $profileCreateRequest,
+   $profileOrder,
+   $profiles,
++  $profileSwitchTarget,
+   $showAllProfiles,
+   ALL_PROFILES,
+   normalizeProfileKey,
+@@ -76,6 +77,7 @@ export function ProfileSwitcher({ compact = false }: { compact?: boolean }) {
+   const order = useStore($profileOrder)
+   const colors = useStore($profileColors)
+   const gatewayProfile = useStore($activeGatewayProfile)
++  const switchTarget = useStore($profileSwitchTarget)
+   const showAll = useStore($showAllProfiles)
+   const multipleConnections = useStore($hasMultipleConnections)
+   const registry = useStore($connectionsRegistry)
+@@ -177,7 +179,7 @@ export function ProfileSwitcher({ compact = false }: { compact?: boolean }) {
+ 
+   return (
+     <div
+-      aria-busy={pendingRoute !== null}
++      aria-busy={pendingRoute !== null || switchTarget !== null}
+       aria-label={p.title}
+       className={cn('min-w-16 shrink overflow-hidden', compact ? 'h-full max-w-40' : 'max-w-72')}
+       data-slot="profile-switcher"
+@@ -225,6 +227,7 @@ export function ProfileSwitcher({ compact = false }: { compact?: boolean }) {
+                 label={profileLabel(profile)}
+                 launchMenu={browserHost}
+                 name={profile.name}
++                pending={switchTarget !== null && switchTarget === normalizeProfileKey(profile.name)}
+                 unserved={unserved.has(normalizeProfileKey(profile.name))}
+               />
+             ))}
+@@ -299,15 +302,18 @@ interface ProfileItemProps {
+   /** Wrap the row in the rail's right-click launch menu (the Webapp's picker). */
+   launchMenu: boolean
+   name: string
++  /** This row's backend is being dialed right now (spinner, not a checkmark). */
++  pending?: boolean
+   /** Listed by its gateway but not served (the Webapp): shown, never picked, since the pick is refused. */
+   unserved: boolean
+ }
+ 
+-function ProfileItem({ color, connectionId, isDefault, label, launchMenu, name, unserved }: ProfileItemProps) {
++function ProfileItem({ color, connectionId, isDefault, label, launchMenu, name, pending = false, unserved }: ProfileItemProps) {
+   const { cancelPrewarm, notePointerMove, startPrewarm } = useProfilePrewarm(name, prewarmProfilePick)
+ 
+   const row = (
+     <DropdownMenuRadioItem
++      aria-busy={pending || undefined}
+       className="min-w-0"
+       disabled={unserved}
+       onPointerEnter={startPrewarm}
+@@ -319,7 +325,11 @@ function ProfileItem({ color, connectionId, isDefault, label, launchMenu, name,
+         <ProfileRowGlyph color={color} isDefault={isDefault} name={name} unserved={unserved} />
+         <span className="truncate">{label}</span>
+       </span>
+-      {unserved && <UnservedProfileNote />}
++      {pending ? (
++        <Loader2 aria-hidden="true" className="ml-auto size-3 shrink-0 animate-spin" />
++      ) : (
++        unserved && <UnservedProfileNote />
++      )}
+     </DropdownMenuRadioItem>
+   )
+ 
+diff --git a/apps/desktop/src/app/chat/sidebar/profile-menu-unserved.test.tsx b/apps/desktop/src/app/chat/sidebar/profile-menu-unserved.test.tsx
+index 274a5a0dbc..f622cdff38 100644
+--- a/apps/desktop/src/app/chat/sidebar/profile-menu-unserved.test.tsx
++++ b/apps/desktop/src/app/chat/sidebar/profile-menu-unserved.test.tsx
+@@ -63,6 +63,7 @@ vi.mock('@/store/profile', () => ({
+   $profileColors: atom({}),
+   $profileCreateRequest: atom(0),
+   $profileOrder: atom([]),
++  $profileSwitchTarget: atom<null | string>(null),
+   $profiles: atom([
+     { is_default: true, name: 'default' },
+     { is_default: false, name: 'research' },
+diff --git a/apps/desktop/src/app/chat/sidebar/profile-rail-connect.test.tsx b/apps/desktop/src/app/chat/sidebar/profile-rail-connect.test.tsx
+index 6fd039f251..50f6bf079c 100644
+--- a/apps/desktop/src/app/chat/sidebar/profile-rail-connect.test.tsx
++++ b/apps/desktop/src/app/chat/sidebar/profile-rail-connect.test.tsx
+@@ -47,6 +47,7 @@ vi.mock('@/store/profile', () => ({
+   $profileColors: atom({}),
+   $profileCreateRequest: atom(0),
+   $profileOrder: atom([]),
++  $profileSwitchTarget: atom<null | string>(null),
+   $profiles: atom([{ is_default: true, name: 'default' }]),
+   $profileScope: atom('default'),
+   // The rail's status summary (profile-dot-state) rides the real session
+diff --git a/apps/desktop/src/app/chat/sidebar/profile-rail-fleet.test.tsx b/apps/desktop/src/app/chat/sidebar/profile-rail-fleet.test.tsx
+index 5511788e17..977dcc881f 100644
+--- a/apps/desktop/src/app/chat/sidebar/profile-rail-fleet.test.tsx
++++ b/apps/desktop/src/app/chat/sidebar/profile-rail-fleet.test.tsx
+@@ -83,6 +83,7 @@ vi.mock('@/store/profile', () => ({
+   $profileColors: atom({}),
+   $profileCreateRequest: atom(0),
+   $profileOrder: atom([]),
++  $profileSwitchTarget: atom<null | string>(null),
+   $profiles: atom([{ is_default: true, name: 'default' }]),
+   $profileScope: atom('default'),
+   // The rail's status summary (profile-dot-state) rides the real session
+diff --git a/apps/desktop/src/app/chat/sidebar/profile-rail-status.test.tsx b/apps/desktop/src/app/chat/sidebar/profile-rail-status.test.tsx
+index 175f1fbbd6..22bcb00cd7 100644
+--- a/apps/desktop/src/app/chat/sidebar/profile-rail-status.test.tsx
++++ b/apps/desktop/src/app/chat/sidebar/profile-rail-status.test.tsx
+@@ -61,6 +61,7 @@ vi.mock('@/store/profile', () => ({
+   $profileColors: atom({}),
+   $profileCreateRequest: atom(0),
+   $profileOrder: atom([]),
++  $profileSwitchTarget: atom<null | string>(null),
+   $profiles: atom([{ is_default: true, name: 'default' }]),
+   $profileScope: atom('default'),
+   $showAllProfiles: atom(false),
+diff --git a/apps/desktop/src/app/chat/sidebar/profile-switcher.tsx b/apps/desktop/src/app/chat/sidebar/profile-switcher.tsx
+index 2e8f69dd68..1bc98460b0 100644
+--- a/apps/desktop/src/app/chat/sidebar/profile-switcher.tsx
++++ b/apps/desktop/src/app/chat/sidebar/profile-switcher.tsx
+@@ -76,6 +76,7 @@ import {
+   $profileOrder,
+   $profiles,
+   $profileScope,
++  $profileSwitchTarget,
+   ALL_PROFILES,
+   normalizeProfileKey,
+   prewarmProfilePick,
+@@ -225,6 +226,9 @@ export function ProfileRail() {
+   const registry = useStore($connectionsRegistry)
+   const activeConnectionId = useStore($activeConnectionId)
+   const roster = useStore($fleetRoster)
++  // Which profile's backend is being dialed right now: drives the spinner on
++  // the picked pill/square for the whole (slow) activation round-trip.
++  const switchTarget = useStore($profileSwitchTarget)
+   const navigate = useNavigate()
+   const [createOpen, setCreateOpen] = useState(false)
+   const [pendingRename, setPendingRename] = useState<null | ProfileInfo>(null)
+@@ -517,6 +521,7 @@ export function ProfileRail() {
+                   onRecolor={color => setProfileColor(profile.name, color)}
+                   onRename={() => setPendingRename(profile)}
+                   onSelect={() => selectProfile(profile.name)}
++                  pending={switchTarget !== null && switchTarget === normalizeProfileKey(profile.name)}
+                   remoteHost={remoteOverrides[normalizeProfileKey(profile.name)]?.host ?? null}
+                 />
+               ))}
+@@ -565,6 +570,7 @@ export function ProfileRail() {
+             glyph={isAll ? 'layers' : 'home'}
+             label={onDefault ? p.showAllProfiles : p.switchToProfile(profileLabel(homeProfile))}
+             onSelect={() => (onDefault ? setShowAllProfiles(true) : selectProfile(homeProfile.name))}
++            pending={switchTarget !== null && switchTarget === normalizeProfileKey(homeProfile.name)}
+             profile={homeProfile.name}
+           />
+         ) : (
+@@ -579,6 +585,7 @@ export function ProfileRail() {
+           glyph="home"
+           label={profileLabel(defaultProfile)}
+           onSelect={() => selectProfile(defaultProfile.name)}
++          pending={switchTarget !== null && switchTarget === normalizeProfileKey(defaultProfile.name)}
+           profile={defaultProfile.name}
+         />
+       )}
+@@ -641,6 +648,7 @@ export function ProfileRail() {
+                               glyph="home"
+                               label={profileLabel(defaultProfile)}
+                               onSelect={() => selectProfile(defaultProfile.name)}
++                              pending={switchTarget !== null && switchTarget === normalizeProfileKey(defaultProfile.name)}
+                               profile={defaultProfile.name}
+                             />
+                           )}
+@@ -1419,6 +1427,9 @@ interface ProfileSquareProps {
+   // is superseded by the fleet rail there.
+   onConnectRemote?: () => void
+   onDelete: () => void
++  // This profile's backend is being dialed right now: the square shows a
++  // spinner instead of its initials for the whole activation round-trip.
++  pending?: boolean
+   // hostname[:port] of this profile's remote override, or null when the
+   // profile runs locally. Drives the "remote" badge on the square.
+   remoteHost: null | string
+@@ -1447,6 +1458,7 @@ function ProfileSquare({
+   onRecolor,
+   onRename,
+   onSelect,
++  pending = false,
+   remoteHost
+ }: ProfileSquareProps) {
+   const { t } = useI18n()
+@@ -1523,6 +1535,7 @@ function ProfileSquare({
+                     type="button"
+                     {...attributes}
+                     {...listeners}
++                    aria-busy={pending || undefined}
+                     aria-label={
+                       [remoteHost ? `${label} — ${p.remoteOverride.badge(remoteHost)}` : label, statusText]
+                         .filter(Boolean)
+@@ -1565,7 +1578,7 @@ function ProfileSquare({
+                     onPointerMove={notePointerMove}
+                     onPointerUp={clearPress}
+                   >
+-                    {profileShortLabel(label)}
++                    {pending ? <Loader2 className="size-3 animate-spin" /> : profileShortLabel(label)}
+                     {/* The "remote" badge: a tiny globe pinned to the corner of an
+                         overridden profile's square, so which profiles leave this
+                         machine is visible at a glance (#91349). */}
+diff --git a/apps/desktop/src/app/contrib/wiring-effects.gateway-scope-refresh.test.tsx b/apps/desktop/src/app/contrib/wiring-effects.gateway-scope-refresh.test.tsx
+new file mode 100644
+index 0000000000..e7afaef7d4
+--- /dev/null
++++ b/apps/desktop/src/app/contrib/wiring-effects.gateway-scope-refresh.test.tsx
+@@ -0,0 +1,117 @@
++import { cleanup, renderHook, waitFor } from '@testing-library/react'
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++
++import { useGatewayScopeRefresh } from './wiring-effects'
++
++const refreshActiveProfile = vi.fn(async () => undefined)
++const resetProjectTreeState = vi.fn()
++
++vi.mock('@/store/profile', async original => ({
++  ...(await original<Record<string, unknown>>()),
++  refreshActiveProfile: () => refreshActiveProfile()
++}))
++
++vi.mock('../right-sidebar/files/use-project-tree', async original => ({
++  ...(await original<Record<string, unknown>>()),
++  resetProjectTreeState: () => resetProjectTreeState()
++}))
++
++function mount(args: {
++  connectionId: null | string
++  profile: string
++  refreshSessions?: () => Promise<unknown> | unknown
++}) {
++  const refreshCurrentModel = vi.fn(async () => undefined)
++  const refreshHermesConfig = vi.fn(async () => undefined)
++  const refreshSessions = vi.fn(args.refreshSessions ?? (async () => undefined))
++
++  const hook = renderHook(
++    (props: { connectionId: null | string; profile: string }) =>
++      useGatewayScopeRefresh(
++        props.connectionId,
++        props.profile,
++        refreshCurrentModel,
++        refreshHermesConfig,
++        refreshSessions
++      ),
++    { initialProps: { connectionId: args.connectionId, profile: args.profile } }
++  )
++
++  return { ...hook, refreshSessions, refreshCurrentModel, refreshHermesConfig }
++}
++
++beforeEach(() => {
++  refreshActiveProfile.mockClear()
++  resetProjectTreeState.mockClear()
++})
++
++afterEach(cleanup)
++
++describe('useGatewayScopeRefresh', () => {
++  it('does not pull anything on the initial scope', () => {
++    const { refreshSessions, refreshCurrentModel } = mount({ connectionId: 'local', profile: 'demand' })
++
++    expect(refreshSessions).not.toHaveBeenCalled()
++    expect(refreshCurrentModel).not.toHaveBeenCalled()
++  })
++
++  // The regression this hook now guards: a profile pick wipes the sidebar rows
++  // and arms the skeleton, then moves $activeGatewayProfile. The socket-open
++  // effect bails while the target backend is still being dialed, so nothing
++  // asked for the new scope's rows and the list stayed empty until the user hit
++  // Refresh. The scope move itself is the moment a pull is owed.
++  it('pulls the sidebar list when the profile moves', async () => {
++    const { refreshSessions, refreshCurrentModel, refreshHermesConfig, rerender } = mount({
++      connectionId: 'local',
++      profile: 'demand'
++    })
++
++    rerender({ connectionId: 'local', profile: 'code-assistant' })
++
++    await waitFor(() => expect(refreshSessions).toHaveBeenCalledTimes(1))
++    expect(refreshCurrentModel).toHaveBeenCalledWith(true)
++    expect(refreshHermesConfig).toHaveBeenCalledWith(true)
++    expect(refreshActiveProfile).toHaveBeenCalledTimes(1)
++    expect(resetProjectTreeState).toHaveBeenCalledTimes(1)
++  })
++
++  it('pulls the sidebar list when the connection moves', async () => {
++    const { refreshSessions, rerender } = mount({ connectionId: 'local', profile: 'default' })
++
++    rerender({ connectionId: 'remote-1', profile: 'default' })
++
++    await waitFor(() => expect(refreshSessions).toHaveBeenCalledTimes(1))
++  })
++
++  // Same scope, new callback identity (every parent render): the scope guard
++  // must keep it from re-pulling the list on each render.
++  it('does not re-pull for a re-render that keeps the scope', async () => {
++    const { refreshSessions, rerender } = mount({ connectionId: 'local', profile: 'demand' })
++
++    rerender({ connectionId: 'local', profile: 'demand' })
++    rerender({ connectionId: 'local', profile: 'demand' })
++
++    expect(refreshSessions).not.toHaveBeenCalled()
++  })
++
++  it('swallows a failed pull instead of surfacing an unhandled rejection', async () => {
++    const onUnhandled = vi.fn()
++    process.on('unhandledRejection', onUnhandled)
++
++    try {
++      const { refreshSessions, rerender } = mount({
++        connectionId: 'local',
++        profile: 'demand',
++        refreshSessions: () => Promise.reject(new Error('backend still dialing'))
++      })
++
++      rerender({ connectionId: 'local', profile: 'code-assistant' })
++
++      await waitFor(() => expect(refreshSessions).toHaveBeenCalledTimes(1))
++      await new Promise(resolve => setTimeout(resolve, 20))
++      expect(onUnhandled).not.toHaveBeenCalled()
++    } finally {
++      process.off('unhandledRejection', onUnhandled)
++    }
++  })
++})
+diff --git a/apps/desktop/src/app/contrib/wiring-effects.ts b/apps/desktop/src/app/contrib/wiring-effects.ts
+index 45ffc6018a..831a5e7da3 100644
+--- a/apps/desktop/src/app/contrib/wiring-effects.ts
++++ b/apps/desktop/src/app/contrib/wiring-effects.ts
+@@ -3,6 +3,7 @@ import { useEffect, useRef } from 'react'
+ import type { NavigateFunction } from 'react-router'
+ 
+ import { $freshSessionRequest, refreshActiveProfile } from '@/store/profile'
++import { refreshProjects, refreshProjectTree } from '@/store/projects'
+ 
+ import { resetProjectTreeState } from '../right-sidebar/files/use-project-tree'
+ import { SETTINGS_ROUTE } from '../routes'
+@@ -75,7 +76,8 @@ export function useGatewayScopeRefresh(
+   activeConnectionId: null | string,
+   activeGatewayProfile: string,
+   refreshCurrentModel: (force: boolean) => Promise<unknown>,
+-  refreshHermesConfig: (force: boolean) => Promise<unknown>
++  refreshHermesConfig: (force: boolean) => Promise<unknown>,
++  refreshSessions: () => Promise<unknown> | unknown
+ ) {
+   const gatewayScope = `${activeConnectionId ?? ''}\0${activeGatewayProfile}`
+   const lastGatewayScopeRef = useRef(gatewayScope)
+@@ -95,5 +97,24 @@ export function useGatewayScopeRefresh(
+     void refreshHermesConfig(true)
+     void refreshActiveProfile()
+     resetProjectTreeState()
+-  }, [gatewayScope, refreshCurrentModel, refreshHermesConfig])
++    // The sidebar's session rows live in nanostores, not React Query, so a
++    // scope move owes an explicit pull: the only other trigger left is an
++    // effect that bails while the gateway is not `open`, and a PROFILE PICK
++    // reaches here with that socket still being dialed — the pick had already
++    // wiped the outgoing rows and armed the skeleton, so nothing else asked
++    // again and the list sat empty until the user hit Refresh. Asking here is
++    // ordering-safe: this passive effect runs after the layout effect that
++    // repoints the list hook's profileScopeRef, so the request is not dropped
++    // as belonging to the profile the window just left. A no-op refusal (the
++    // scope moved again, or the backend is still dialing) is best-effort: the
++    // socket-open effect and the activation-epoch re-read both still cover it.
++    void Promise.resolve()
++      .then(() => refreshSessions())
++      .catch(() => undefined)
++    // The grouped sidebar's rows come from the project overview, which the pick
++    // wipes; without an explicit re-pull the group stays empty until some
++    // unrelated projects.changed tick lands.
++    void refreshProjects().catch(() => undefined)
++    void refreshProjectTree().catch(() => undefined)
++  }, [gatewayScope, refreshCurrentModel, refreshHermesConfig, refreshSessions])
+ }
+diff --git a/apps/desktop/src/app/contrib/wiring.tsx b/apps/desktop/src/app/contrib/wiring.tsx
+index bbfec06756..f7e1cc09ba 100644
+--- a/apps/desktop/src/app/contrib/wiring.tsx
++++ b/apps/desktop/src/app/contrib/wiring.tsx
+@@ -576,7 +576,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
+   })
+ 
+   useFreshSessionRequest(startFreshSessionDraft)
+-  useGatewayScopeRefresh(activeConnectionId, activeGatewayProfile, refreshCurrentModel, refreshHermesConfig)
++  useGatewayScopeRefresh(activeConnectionId, activeGatewayProfile, refreshCurrentModel, refreshHermesConfig, refreshSessions)
+ 
+   // New session anchored to a workspace. Seeds cwd + branch from the clicked
+   // workspace; an explicit worktree path also drills the sidebar into that
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions/index.ts b/apps/desktop/src/app/session/hooks/use-session-actions/index.ts
+index 08cde0a4c6..cd9bfb7bfd 100644
+--- a/apps/desktop/src/app/session/hooks/use-session-actions/index.ts
++++ b/apps/desktop/src/app/session/hooks/use-session-actions/index.ts
+@@ -50,6 +50,7 @@ import {
+   $gatewaySwapTarget,
+   $newChatProfile,
+   $profiles,
++  $profileSwitchTarget,
+   type AgentProfileRoute,
+   ensureGatewayAgent,
+   ensureGatewayProfile,
+@@ -1175,6 +1176,16 @@ export function useSessionActions({
+         return
+       }
+ 
++      // A profile pick is dialing ANOTHER backend. Every id still on screen
++      // belongs to the outgoing profile, so resuming it would open (or write
++      // into) the wrong profile's session — the sidebar wipes its rows on the
++      // pick for that reason, but tiles, the project tree and search results
++      // can still fire a stale click. Drop it: the list repaints from the
++      // target backend once the switch settles.
++      if ($profileSwitchTarget.get()) {
++        return
++      }
++
+       const requestId = resumeRequestRef.current + 1
+       const routeToken = getRouteToken()
+       resumeRequestRef.current = requestId
+diff --git a/apps/desktop/src/app/session/hooks/use-session-list-actions.test.tsx b/apps/desktop/src/app/session/hooks/use-session-list-actions.test.tsx
+index 4b99577520..7a6acd3222 100644
+--- a/apps/desktop/src/app/session/hooks/use-session-list-actions.test.tsx
++++ b/apps/desktop/src/app/session/hooks/use-session-list-actions.test.tsx
+@@ -10,6 +10,7 @@ import {
+   recoverActiveSourceAfterFailedGatewaySwitch,
+   registerGatewaySwitchLifecycle
+ } from '@/store/gateway-switch'
++import { $profileSwitchTarget } from '@/store/profile'
+ import {
+   $cronSessions,
+   $messagingPlatformTotals,
+@@ -42,6 +43,24 @@ import { useSessionListActions } from './use-session-list-actions'
+ // identity — that identity is the dependency for every sidebar memo — and
+ // must not flicker the loading flag over an already-populated list.
+ 
++
++// refreshSessions only publishes a page whose profile is the sidebar's LIVE
++// scope (read from $profileScope), so a rendered scope has to move that atom
++// too. Stub it instead of setting $activeGatewayProfile: the real atom's
++// subscriber invalidates profile-scoped queries and pokes the starmap.
++const liveScope = vi.hoisted(() => ({ value: 'default' }))
++
++vi.mock('@/store/profile', async importOriginal => ({
++  ...(await importOriginal<Record<string, unknown>>()),
++  $profileScope: { get: () => liveScope.value }
++}))
++
++const renderList = (profileScope: string) => {
++  liveScope.value = profileScope
++
++  return renderHook(() => useSessionListActions({ profileScope }))
++}
++
+ const row = (id: string, over: Partial<SessionInfo> = {}): SessionInfo =>
+   ({
+     ended_at: null,
+@@ -163,7 +182,7 @@ describe('workspace-only sidebar refresh', () => {
+       listSidebarSessions.mockResolvedValue(
+         sidebar({ sessions: [incoming] }, [{ ...incoming, source: 'cron' }], [{ ...incoming, source: 'telegram' }])
+       )
+-      const { result } = renderHook(() => useSessionListActions({ profileScope: 'default' }))
++      const { result } = renderList('default')
+ 
+       await act(async () => {
+         await result.current.refreshSessions()
+@@ -194,7 +213,7 @@ describe('refreshSessions cold-start load error', () => {
+ 
+   it('flags a thrown first read and clears the flag once a retry lands rows', async () => {
+     listSidebarSessions.mockRejectedValueOnce(new Error('ECONNREFUSED'))
+-    const { result } = renderHook(() => useSessionListActions({ profileScope: 'default' }))
++    const { result } = renderList('default')
+ 
+     await act(async () => {
+       await result.current.refreshSessions().catch(() => undefined)
+@@ -214,7 +233,7 @@ describe('refreshSessions cold-start load error', () => {
+ 
+   it('flags a reported scan failure that leaves the list empty', async () => {
+     listSidebarSessions.mockResolvedValueOnce(failedScan())
+-    const { result } = renderHook(() => useSessionListActions({ profileScope: 'default' }))
++    const { result } = renderList('default')
+ 
+     await act(async () => {
+       await result.current.refreshSessions()
+@@ -230,7 +249,7 @@ describe('refreshSessions cold-start load error', () => {
+       messaging: { errors: [{ error: 'schema heal exhausted', profile: 'default' }], failed: true, retry: true },
+       recents: { errors: [{ error: 'schema heal exhausted', profile: 'default' }], failed: true, retry: true }
+     })
+-    const { result } = renderHook(() => useSessionListActions({ profileScope: 'default' }))
++    const { result } = renderList('default')
+ 
+     await act(async () => {
+       await result.current.refreshSessions()
+@@ -242,7 +261,7 @@ describe('refreshSessions cold-start load error', () => {
+ 
+   it('leaves a corrupt store to its own notice instead of offering retry', async () => {
+     listSidebarSessions.mockResolvedValueOnce(failedScan({ default: 'corrupt' }))
+-    const { result } = renderHook(() => useSessionListActions({ profileScope: 'default' }))
++    const { result } = renderList('default')
+ 
+     await act(async () => {
+       await result.current.refreshSessions()
+@@ -254,7 +273,7 @@ describe('refreshSessions cold-start load error', () => {
+   it('never flags a failed refresh over rows already on screen', async () => {
+     setSessions([row('a')])
+     listSidebarSessions.mockRejectedValueOnce(new Error('ECONNREFUSED'))
+-    const { result } = renderHook(() => useSessionListActions({ profileScope: 'default' }))
++    const { result } = renderList('default')
+ 
+     await act(async () => {
+       await result.current.refreshSessions().catch(() => undefined)
+@@ -269,7 +288,7 @@ describe('refreshSessions cold-start load error', () => {
+       ...sidebar({ sessions: [row('a')] }),
+       errors: [{ error: 'database is locked', profile: 'work' }]
+     })
+-    const { result } = renderHook(() => useSessionListActions({ profileScope: 'all' }))
++    const { result } = renderList('all')
+ 
+     await act(async () => {
+       await result.current.refreshSessions()
+@@ -292,7 +311,7 @@ describe('refreshSessions identity + loading hygiene', () => {
+     const rows = [row('a'), row('b')]
+     listSidebarSessions.mockResolvedValue(sidebar({ sessions: rows }))
+ 
+-    const { result } = renderHook(() => useSessionListActions({ profileScope: 'default' }))
++    const { result } = renderList('default')
+ 
+     await act(async () => {
+       await result.current.refreshSessions()
+@@ -313,7 +332,7 @@ describe('refreshSessions identity + loading hygiene', () => {
+ 
+   it('swaps the array when rows actually changed', async () => {
+     listSidebarSessions.mockResolvedValue(sidebar({ sessions: [row('a')] }))
+-    const { result } = renderHook(() => useSessionListActions({ profileScope: 'default' }))
++    const { result } = renderList('default')
+ 
+     await act(async () => {
+       await result.current.refreshSessions()
+@@ -333,7 +352,7 @@ describe('refreshSessions identity + loading hygiene', () => {
+ 
+   it('does not flicker the loading flag over a populated list', async () => {
+     listSidebarSessions.mockResolvedValue(sidebar({ sessions: [row('a')] }))
+-    const { result } = renderHook(() => useSessionListActions({ profileScope: 'default' }))
++    const { result } = renderList('default')
+ 
+     await act(async () => {
+       await result.current.refreshSessions()
+@@ -362,7 +381,7 @@ describe('refreshSessions identity + loading hygiene', () => {
+       })
+     )
+ 
+-    const { result } = renderHook(() => useSessionListActions({ profileScope: 'default' }))
++    const { result } = renderList('default')
+ 
+     await act(async () => {
+       await result.current.refreshSessions()
+@@ -389,7 +408,7 @@ describe('refreshSessions identity + loading hygiene', () => {
+ 
+     listSidebarSessions.mockResolvedValue(sidebar({ sessions: [row('mine', { message_count: 3 })] }))
+ 
+-    const { result } = renderHook(() => useSessionListActions({ profileScope: 'default' }))
++    const { result } = renderList('default')
+ 
+     await act(async () => {
+       await result.current.refreshSessions()
+@@ -408,7 +427,7 @@ describe('refreshSessions identity + loading hygiene', () => {
+     const pending = deferred<SidebarSessionsResponse>()
+     listSidebarSessions.mockReturnValue(pending.promise)
+ 
+-    const { result } = renderHook(() => useSessionListActions({ profileScope: 'default' }))
++    const { result } = renderList('default')
+ 
+     const refresh = result.current.refreshSessions()
+ 
+@@ -441,7 +460,7 @@ describe('refreshSessions identity + loading hygiene', () => {
+     const pending = deferred<SidebarSessionsResponse>()
+     listSidebarSessions.mockReturnValue(pending.promise)
+ 
+-    const { result } = renderHook(() => useSessionListActions({ profileScope: 'default' }))
++    const { result } = renderList('default')
+ 
+     const refresh = result.current.refreshSessions()
+ 
+@@ -466,7 +485,7 @@ describe('refreshSessions identity + loading hygiene', () => {
+     const pending = deferred<SidebarSessionsResponse>()
+     listSidebarSessions.mockReturnValue(pending.promise)
+ 
+-    const { result } = renderHook(() => useSessionListActions({ profileScope: 'default' }))
++    const { result } = renderList('default')
+ 
+     const refresh = result.current.refreshSessions()
+ 
+@@ -497,7 +516,7 @@ describe('refreshSessions identity + loading hygiene', () => {
+     const idle = [row('yesterday'), row('week')]
+     listSidebarSessions.mockResolvedValue(sidebar({ sessions: idle }))
+ 
+-    const { result } = renderHook(() => useSessionListActions({ profileScope: 'default' }))
++    const { result } = renderList('default')
+ 
+     await act(async () => {
+       await result.current.refreshSessions()
+@@ -526,7 +545,7 @@ describe('refreshSessions identity + loading hygiene', () => {
+ 
+   it('still accepts a genuine empty recents page when the backend reported no errors', async () => {
+     listSidebarSessions.mockResolvedValue(sidebar({ sessions: [row('a')] }))
+-    const { result } = renderHook(() => useSessionListActions({ profileScope: 'default' }))
++    const { result } = renderList('default')
+ 
+     await act(async () => {
+       await result.current.refreshSessions()
+@@ -550,7 +569,7 @@ describe('refreshSessions identity + loading hygiene', () => {
+       sidebar({ sessions: [] }, [], [row('tg-1', { source: 'telegram' }), row('tg-2', { source: 'telegram' })])
+     )
+ 
+-    const { result } = renderHook(() => useSessionListActions({ profileScope: 'default' }))
++    const { result } = renderList('default')
+ 
+     await act(async () => {
+       await result.current.refreshSessions()
+@@ -577,7 +596,7 @@ describe('refreshSessions identity + loading hygiene', () => {
+ 
+   it('still shows loading for the initial (empty-list) fetch', async () => {
+     listSidebarSessions.mockResolvedValue(sidebar({ sessions: [row('a')] }))
+-    const { result } = renderHook(() => useSessionListActions({ profileScope: 'default' }))
++    const { result } = renderList('default')
+ 
+     const loadingStates: boolean[] = []
+     const off = $sessionsLoading.subscribe(value => loadingStates.push(value))
+@@ -596,7 +615,7 @@ describe('refreshSessions identity + loading hygiene', () => {
+ 
+     listSidebarSessions.mockReturnValue(pending.promise)
+ 
+-    const { result } = renderHook(() => useSessionListActions({ profileScope: 'default' }))
++    const { result } = renderList('default')
+     const refresh = result.current.refreshSessions(() => ownsRefresh)
+ 
+     expect($sessionsLoading.get()).toBe(true)
+@@ -638,7 +657,7 @@ describe('refreshSessions identity + loading hygiene', () => {
+ 
+     listSidebarSessions.mockReturnValue(pending.promise)
+ 
+-    const { result } = renderHook(() => useSessionListActions({ profileScope: 'default' }))
++    const { result } = renderList('default')
+ 
+     const off = registerGatewaySwitchLifecycle({
+       beforeConnectionSwitch: () => undefined,
+@@ -691,7 +710,7 @@ describe('refreshSessions identity + loading hygiene', () => {
+     listSidebarSessions
+       .mockReturnValueOnce(pending.promise)
+       .mockResolvedValueOnce(sidebar({ sessions: [row('current')] }))
+-    const { result } = renderHook(() => useSessionListActions({ profileScope: 'default' }))
++    const { result } = renderList('default')
+ 
+     let refresh!: Promise<void>
+ 
+@@ -728,7 +747,7 @@ describe('refreshSessions identity + loading hygiene', () => {
+     const pending = deferred<SidebarSessionsResponse>()
+     const rows = [row('a'), row('b')]
+     listSidebarSessions.mockReturnValueOnce(pending.promise).mockResolvedValueOnce(sidebar({ sessions: rows }))
+-    const { result } = renderHook(() => useSessionListActions({ profileScope: 'default' }))
++    const { result } = renderList('default')
+ 
+     let refresh!: Promise<void>
+ 
+@@ -749,7 +768,7 @@ describe('refreshSessions identity + loading hygiene', () => {
+   it('does not re-read a refresh a newer one already superseded', async () => {
+     const older = deferred<SidebarSessionsResponse>()
+     listSidebarSessions.mockReturnValueOnce(older.promise).mockResolvedValueOnce(sidebar({ sessions: [row('newer')] }))
+-    const { result } = renderHook(() => useSessionListActions({ profileScope: 'default' }))
++    const { result } = renderList('default')
+ 
+     const olderRefresh = result.current.refreshSessions()
+     gatewayScope.epoch += 1
+@@ -768,7 +787,7 @@ describe('refreshSessions identity + loading hygiene', () => {
+ describe('refreshSessions batches slices into one request', () => {
+   it('forwards the active profile scope + section limits to the batched call', async () => {
+     listSidebarSessions.mockResolvedValue(sidebar({ sessions: [] }))
+-    const { result } = renderHook(() => useSessionListActions({ profileScope: 'work' }))
++    const { result } = renderList('work')
+ 
+     await act(async () => {
+       await result.current.refreshSessions()
+@@ -792,6 +811,7 @@ describe('refreshSessions batches slices into one request', () => {
+ 
+     const staleRefresh = result.current.refreshSessions
+ 
++    liveScope.value = 'personal'
+     rerender({ profileScope: 'personal' })
+ 
+     await act(async () => {
+@@ -820,6 +840,9 @@ describe('refreshSessions batches slices into one request', () => {
+ 
+     listSidebarSessions.mockResolvedValue(sidebar({ sessions: [] }))
+ 
++    // A discarded render never commits, so the sidebar's live scope is still work.
++    liveScope.value = 'work'
++
+     const view = render(
+       <Suspense fallback={null}>
+         <Harness profileScope="work" suspend={false} />
+@@ -855,6 +878,7 @@ describe('refreshSessions batches slices into one request', () => {
+ 
+     const workRefresh = result.current.refreshSessions()
+ 
++    liveScope.value = 'personal'
+     rerender({ profileScope: 'personal' })
+     const personalRefresh = result.current.refreshSessions()
+ 
+@@ -888,7 +912,7 @@ describe('refreshSessions batches slices into one request', () => {
+     const personal = deferred<SidebarSessionsResponse>()
+ 
+     listSidebarSessions.mockReturnValueOnce(work.promise).mockReturnValueOnce(personal.promise)
+-    const { result } = renderHook(() => useSessionListActions({ profileScope: 'default' }))
++    const { result } = renderList('default')
+     const workRefresh = result.current.refreshSessions()
+ 
+     gatewayScope.epoch += 1
+@@ -930,6 +954,7 @@ describe('refreshSessions batches slices into one request', () => {
+ 
+     const workRefresh = result.current.refreshCronJobs()
+ 
++    liveScope.value = 'personal'
+     rerender({ profileScope: 'personal' })
+     const personalRefresh = result.current.refreshCronJobs()
+ 
+@@ -964,7 +989,7 @@ describe('messaging profile scope', () => {
+       sessions: [row('m1', { profile: 'work', source: 'signal' }), row('m2', { profile: 'work', source: 'signal' })],
+       total: 2
+     })
+-    const { result } = renderHook(() => useSessionListActions({ profileScope: 'work' }))
++    const { result } = renderList('work')
+ 
+     await act(async () => {
+       await result.current.loadMoreMessagingForPlatform('signal')
+@@ -1002,7 +1027,7 @@ describe('messaging profile scope', () => {
+     setMessagingPlatformTotals({ 'work:signal': 12 })
+     listAllProfileSessions.mockRejectedValue(new Error('request failed'))
+ 
+-    const { result } = renderHook(() => useSessionListActions({ profileScope: 'work' }))
++    const { result } = renderList('work')
+ 
+     await act(async () => {
+       await expect(result.current.loadMoreMessagingForPlatform('signal')).resolves.toBeUndefined()
+@@ -1028,6 +1053,7 @@ describe('messaging profile scope', () => {
+ 
+     expect($messagingPlatformTotals.get()).toEqual({ 'work:signal': 42 })
+ 
++    liveScope.value = 'personal'
+     rerender({ profileScope: 'personal' })
+ 
+     expect($messagingPlatformTotals.get()['personal:signal']).toBeUndefined()
+@@ -1044,6 +1070,7 @@ describe('messaging profile scope', () => {
+ 
+     expect($messagingPlatformTotals.get()).toEqual({ 'personal:signal': 3, 'work:signal': 42 })
+ 
++    liveScope.value = 'work'
+     rerender({ profileScope: 'work' })
+ 
+     expect($messagingPlatformTotals.get()['work:signal']).toBe(42)
+@@ -1056,7 +1083,7 @@ describe('messaging profile scope', () => {
+     setMessagingSessions([row('m1', { profile: 'work', source: 'signal' })])
+     listAllProfileSessions.mockImplementationOnce(() => older.promise).mockImplementationOnce(() => newer.promise)
+ 
+-    const { result } = renderHook(() => useSessionListActions({ profileScope: 'work' }))
++    const { result } = renderList('work')
+     const olderLoad = result.current.loadMoreMessagingForPlatform('signal')
+ 
+     setMessagingSessions([
+@@ -1100,6 +1127,7 @@ describe('messaging profile scope', () => {
+     })
+ 
+     const workRefresh = result.current.refreshMessagingSessions()
++    liveScope.value = 'personal'
+     rerender({ profileScope: 'personal' })
+     const personalRefresh = result.current.refreshMessagingSessions()
+ 
+@@ -1127,6 +1155,7 @@ describe('messaging profile scope', () => {
+ 
+     const staleRefresh = result.current.refreshMessagingSessions
+ 
++    liveScope.value = 'personal'
+     rerender({ profileScope: 'personal' })
+ 
+     await act(async () => {
+@@ -1141,7 +1170,7 @@ describe('messaging profile scope', () => {
+     const pending = deferred<{ sessions: SessionInfo[]; total: number }>()
+     const rows = [row('tg', { source: 'telegram' })]
+     listAllProfileSessions.mockReturnValueOnce(pending.promise).mockResolvedValueOnce({ sessions: rows, total: 1 })
+-    const { result } = renderHook(() => useSessionListActions({ profileScope: 'default' }))
++    const { result } = renderList('default')
+ 
+     const refresh = result.current.refreshMessagingSessions()
+     gatewayScope.epoch += 1
+@@ -1155,3 +1184,58 @@ describe('messaging profile scope', () => {
+     expect($messagingSessions.get().map(session => session.id)).toEqual(['tg'])
+   })
+ })
++
++// A PROFILE PICK wipes the sidebar rows first and only moves $profileScope
++// when the target backend finishes dialing. A page requested for the profile
++// being LEFT can land inside that window; publishing it paints the outgoing
++// profile's rows under the new pick, and nothing re-pulls on the pick's own
++// account — that is the "old sessions stay until I hit Refresh" bug.
++describe('profile pick strands the outgoing profile’s page', () => {
++  afterEach(() => {
++    $profileSwitchTarget.set(null)
++  })
++
++  it('refuses to start a refresh for the profile being left', async () => {
++    const { result } = renderList('demand')
++
++    $profileSwitchTarget.set('code-assistant')
++
++    await act(async () => {
++      await result.current.refreshSessions()
++    })
++
++    expect(listSidebarSessions).not.toHaveBeenCalled()
++  })
++
++  it('drops a page that lands mid-pick instead of repainting the old rows', async () => {
++    const pending = deferred<SidebarSessionsResponse>()
++    listSidebarSessions.mockReturnValueOnce(pending.promise)
++    const { result } = renderList('demand')
++
++    const refresh = result.current.refreshSessions()
++    $profileSwitchTarget.set('code-assistant')
++
++    await act(async () => {
++      pending.resolve(sidebar({ sessions: [row('outgoing')] }))
++      await refresh
++    })
++
++    expect($sessions.get()).toEqual([])
++    // The skeleton stays armed: the target profile's own pull lowers it.
++    expect($sessionsLoading.get()).toBe(true)
++  })
++
++  it('still publishes for the switch target itself', async () => {
++    listSidebarSessions.mockResolvedValue(sidebar({ sessions: [row('incoming')] }))
++    const { result } = renderList('code-assistant')
++
++    $profileSwitchTarget.set('code-assistant')
++
++    await act(async () => {
++      await result.current.refreshSessions()
++    })
++
++    expect($sessions.get().map(session => session.id)).toEqual(['incoming'])
++    expect($sessionsLoading.get()).toBe(false)
++  })
++})
+diff --git a/apps/desktop/src/app/session/hooks/use-session-list-actions.ts b/apps/desktop/src/app/session/hooks/use-session-list-actions.ts
+index 759f64c2b3..1c0d3b2042 100644
+--- a/apps/desktop/src/app/session/hooks/use-session-list-actions.ts
++++ b/apps/desktop/src/app/session/hooks/use-session-list-actions.ts
+@@ -18,7 +18,7 @@ import {
+   SIDEBAR_FILTERED_PAGE_SIZE,
+   SIDEBAR_SESSIONS_PAGE_SIZE
+ } from '@/store/layout'
+-import { messagingTotalsKey, normalizeProfileKey, sidebarProfileForScope } from '@/store/profile'
++import { $profileScope, $profileSwitchTarget, messagingTotalsKey, normalizeProfileKey, sidebarProfileForScope } from '@/store/profile'
+ import {
+   $messagingSessions,
+   $selectedStoredSessionId,
+@@ -327,7 +327,37 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
+     async (shouldPublish: () => boolean = () => true) => {
+       const sessionProfile = sidebarProfileForScope(profileScope)
+ 
+-      if (!shouldPublish() || sidebarProfileForScope(profileScopeRef.current) !== sessionProfile) {
++      // Compare against the LIVE scope atom, never against the capture: a
++      // callback can outlive its render by seconds (a coalesced timer, a
++      // subscription, a boot callback), and after a PROFILE PICK it still
++      // names the profile the window left. Its own `profileScopeRef` copy was
++      // re-pointed by then in the ordinary case — which is exactly why the
++      // stale call looked legitimate and repainted the outgoing profile's rows
++      // over the new profile's list. The atom is the sidebar's real scope at
++      // publish time; anything else is a page about a profile nobody is
++      // looking at any more.
++      const liveScopeMatches = () => sidebarProfileForScope($profileScope.get()) === sessionProfile
++
++      if (!shouldPublish() || !liveScopeMatches()) {
++        return
++      }
++
++      // A PROFILE PICK wipes the rows synchronously and then dials the target
++      // backend, which can take seconds. A page requested for the profile the
++      // window is LEAVING can land inside that window, and publishing it
++      // repaints the outgoing profile's rows under the new pick — the pick
++      // itself moves no scope atom until activation returns, so the scope
++      // compare above still reads as current and lets it through. Nothing
++      // re-pulls on the pick's own account, so those rows then sit there until
++      // the user hits Refresh. Strand anything that is not the switch target:
++      // only that profile's page may publish while a switch is in flight.
++      const strandedByProfileSwitch = () => {
++        const target = $profileSwitchTarget.get()
++
++        return target !== null && sidebarProfileForScope(target) !== sessionProfile
++      }
++
++      if (strandedByProfileSwitch()) {
+         return
+       }
+ 
+@@ -346,8 +376,9 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
+ 
+       const owns = () =>
+         shouldPublish() &&
++        !strandedByProfileSwitch() &&
+         refreshSessionsRequestRef.current === requestId &&
+-        sidebarProfileForScope(profileScopeRef.current) === sessionProfile
++        liveScopeMatches()
+ 
+       // Snapshot the removal lifecycle BEFORE the first read: a page read
+       // pre-archive-commit can land post-prune, and only the generation
+@@ -424,9 +455,8 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
+           setSessions(prev => {
+             const incoming = dropTombstoned(
+               carryForwardFailedProfileSessions(prev, recents.sessions ?? [], recents.errors ?? result.errors)
+-            )
++            )            // Filter AFTER the merge: the guard must also catch survivors
+ 
+-            // Filter AFTER the merge: the guard must also catch survivors
+             // (a stale previous slice can still hold the doomed row through
+             // the keep set once the tombstone prune has cleared membership).
+             const next = dropRemovalRaced(mergeSessionPage(prev, incoming, sessionsToKeep()), removalSnapshot)
+@@ -508,14 +538,21 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
+       } finally {
+         // Request identity preserves the zero-argument refresh contract across a
+         // failed activation epoch; an explicit owner predicate is stronger and
+-        // must never release a newer switch's loading barrier.
+-        if (showLoading && shouldPublish() && refreshSessionsRequestRef.current === requestId) {
++        // must never release a newer switch's loading barrier. A page stranded
++        // by an in-flight profile pick keeps the skeleton armed: the target
++        // profile's own pull lowers it.
++        if (
++          showLoading &&
++          shouldPublish() &&
++          !strandedByProfileSwitch() &&
++          refreshSessionsRequestRef.current === requestId
++        ) {
+           setSessionsLoading(false)
+         }
+       }
+ 
+       // Cron *jobs* are a distinct API (getCronJobs), not a session slice.
+-      if (shouldPublish() && sidebarProfileForScope(profileScopeRef.current) === sessionProfile) {
++      if (shouldPublish() && liveScopeMatches()) {
+         void refreshCronJobs()
+       }
+     },
+diff --git a/apps/desktop/src/store/gateway-switch.ts b/apps/desktop/src/store/gateway-switch.ts
+index 90999567f5..43ca8efc7e 100644
+--- a/apps/desktop/src/store/gateway-switch.ts
++++ b/apps/desktop/src/store/gateway-switch.ts
+@@ -8,8 +8,9 @@ import { invalidateCronJobsRequests, setCronJobs } from '@/store/cron'
+ import { resetDeadSessionPrune } from '@/store/dead-session-prune'
+ import { resetSessionsLimit } from '@/store/layout'
+ import { resetLiveSync } from '@/store/live-sync'
+-import { invalidateProfileListFetches } from '@/store/profile'
++import { invalidateProfileListFetches, registerProfileSwitchBridge } from '@/store/profile'
+ import { exitProjectScope } from '@/store/project-scope'
++import { refreshProjects, refreshProjectTree, resetProjectsForProfileSwitch } from '@/store/projects'
+ import { clearLiveReactionOverlays } from '@/store/reactions-local'
+ import {
+   $unreadFinishedSessionIds,
+@@ -299,3 +300,55 @@ export function wipeSessionListsForGatewaySwitch(): void {
+   // scoped, so a mode swap must not refetch them.
+   invalidateProfileScopedQueries()
+ }
++
++/**
++ * Sidebar-only wipe for a PROFILE pick (same backend, different home/DB).
++ *
++ * Deliberately NOT `wipeSessionListsForGatewaySwitch`: a profile pick must not
++ * close the user's terminals, reset the project tree, or drop the draft — the
++ * connection switch does that because it replaces the machine context, while a
++ * profile pick already navigates to a fresh chat and re-scopes the project tree
++ * through `leaveForeignProjectScope`.
++ *
++ * What it must do is drop the outgoing profile's ROWS and arm the skeleton: the
++ * pick dials a backend that can take 4–8 s to answer (`hermes gateway ensure`),
++ * and the sidebar otherwise keeps painting the previous profile's sessions as
++ * if they were the target's.
++ */
++function beginProfileSwitch(): void {
++  setSessions([])
++  setCronSessions([])
++  setMessagingSessions([])
++  setSessionsLoading(true)
++  setSessionsLoadError(false)
++  setSessionProfilesFailed([])
++  setSessionProfilesTruncated({})
++  // The GROUPED sidebar reads its rows off the project tree, not $sessions, so
++  // wiping the session lists alone leaves the outgoing profile's project rows
++  // painted for the whole dial. Same synchronous step, same reason.
++  resetProjectsForProfileSwitch()
++}
++
++/**
++ * Repaint the still-active source after a FAILED profile pick. A failed switch
++ * moves no profile scope, so no reactive path re-pulls the lists the wipe
++ * emptied: the sidebar would sit on skeletons until the user reloaded.
++ */
++function recoverActiveSourceAfterFailedProfileSwitch(): void {
++  void Promise.resolve()
++    .then(() => switchLifecycle?.refreshSessions())
++    .catch(() => undefined)
++    .finally(() => setSessionsLoading(false))
++  // The wipe dropped the still-active profile's project overview too, and a
++  // FAILED pick moves no scope, so nothing else would re-pull it.
++  void refreshProjects().catch(() => undefined)
++  void refreshProjectTree().catch(() => undefined)
++}
++
++// Registered in THIS direction: this module already imports @/store/profile, so
++// profile.ts must not import it back (import cycle). Module scope keeps the
++// bridge live for the app's lifetime.
++registerProfileSwitchBridge({
++  begin: beginProfileSwitch,
++  recover: recoverActiveSourceAfterFailedProfileSwitch
++})
+diff --git a/apps/desktop/src/store/gateway.test.ts b/apps/desktop/src/store/gateway.test.ts
+index 14758741bb..56cf3b2d63 100644
+--- a/apps/desktop/src/store/gateway.test.ts
++++ b/apps/desktop/src/store/gateway.test.ts
+@@ -72,9 +72,12 @@ vi.mock('@/store/notify-baseline', () => ({ markNativeNotifyBaseline: vi.fn() })
+ 
+ const {
+   activeGateway,
++  activeGatewayProfileKey,
++  activeGatewayRoute,
+   closeSecondaryGateways,
+   configureGatewayRegistry,
+   dispatchPrimaryServerRequest,
++  $activeGatewayRoute,
+   ensureGatewayForProfile,
+   openGatewayForAgent,
+   pruneSecondaryGateways,
+@@ -495,3 +498,31 @@ describe('secondary reconnect backoff (#83134)', () => {
+     expect(gatewayMocks.connect.mock.calls.length).toBeLessThanOrEqual(10)
+   })
+ })
++
++// A PROFILE PICK that rides the primary socket (local multi-profile / global
++// remote share) must publish the PICKED profile as the active route. It used to
++// publish the primary's own profile - `default` - which store/profile.ts mirrors
++// into $activeGatewayProfile: for as long as the real route took to land, the
++// sidebar believed it was on `default` and repainted that profile's sessions over
++// the pick's ("the old list stays until I hit Refresh"). The socket is the
++// primary's either way; the SERVED profile is what every consumer routes by.
++describe('shared-primary activation publishes the served profile', () => {
++  it('reports the picked profile, not the primary it rides', async () => {
++    const getConnection = vi.fn(async ({ profile }: { profile: string }) => ({
++      authMode: 'token',
++      baseUrl: `https://${profile}.invalid`,
++      mode: 'local',
++      profile,
++      sharedPrimary: true,
++      token: 'fake-test-token',
++      wsUrl: `wss://${profile}.invalid/ws`
++    }))
++
++    installDesktop({ getConnection })
++
++    await ensureGatewayForProfile('work')
++
++    expect(activeGatewayProfileKey()).toBe('work')
++    expect($activeGatewayRoute.get()).toBe('work')
++  })
++})
+diff --git a/apps/desktop/src/store/gateway.ts b/apps/desktop/src/store/gateway.ts
+index 8f82454abf..a31d5527e1 100644
+--- a/apps/desktop/src/store/gateway.ts
++++ b/apps/desktop/src/store/gateway.ts
+@@ -557,7 +557,7 @@ function beginGatewayActivation(): number {
+   return $gatewayActivationEpoch.get()
+ }
+ 
+-function applyActive(profile: string, activationEpoch: number): boolean {
++function applyActive(profile: string, activationEpoch: number, servedProfile?: string): boolean {
+   if (gatewayActivationEpoch() !== activationEpoch) {
+     return false
+   }
+@@ -571,7 +571,16 @@ function applyActive(profile: string, activationEpoch: number): boolean {
+   // truth for "which profile is the active gateway on" — every eviction /
+   // fallback path funnels through applyActive, so the published profile can
+   // never linger on a backend that is no longer selected (#89206).
+-  const routeProfile = activeRouteProfile()
++  // A SHARED-primary activation (local multi-profile, global-remote share) opens
++  // the PRIMARY socket to serve a DIFFERENT profile. Reading the route off
++  // activeKey there publishes the primary's own name, and store/profile.ts
++  // mirrors that into $activeGatewayProfile — so the sidebar (which follows the
++  // atom) reloads the PRIMARY's session list for as long as the real route takes
++  // to land, which is the "old list until I hit Refresh" report. `profile` is
++  // the profile this activation actually serves; it is what consumers route by.
++  // activeRouteProfile() stays socket-derived: the "did it land?" check and the
++  // request-scope keys must keep describing the socket, not the pick.
++  const routeProfile = servedProfile === undefined ? activeRouteProfile() : normKey(servedProfile)
+ 
+   // One notification frame for the whole route: a $gateway listener (the
+   // display-toggle auto-push) notified before the profile half was published
+@@ -1722,8 +1731,20 @@ export async function ensureGatewayForAgent(
+   const activationEpoch = beginGatewayActivation()
+ 
+   if (await ridesPrimaryBackend(connectionId, profile)) {
++    // Reusing the primary socket for a profile the route ALREADY serves must not
++    // re-publish the route. applyActive here would announce the primary's own
++    // name (the socket's identity), and store/profile.ts mirrors that into
++    // $activeGatewayProfile: a background dial 4 s after a profile pick yanked
++    // the sidebar onto the primary's session list, then the real route landed
++    // 100 ms later and pulled it back — the "old list until I hit Refresh"
++    // report. Nothing to move means nothing to announce.
++    if (normKey($activeGatewayRoute.get()) === normKey(profile)) {
++      return !signal?.aborted
++    }
++
+     // A retained primary can be open while the foreground still points at a
+     // different source. Reusing its socket must also move the active route.
++
+     return Boolean(isOpen(g.primaryGateway) && !signal?.aborted && applyActive(g.primaryProfile, activationEpoch))
+   }
+ 
+@@ -1804,7 +1825,7 @@ export async function ensureGatewayForProfile(profile: string): Promise<void> {
+   // descriptor — $activeGatewayProfile still moves to `key`, so request
+   // scoping and profile-aware surfaces behave identically.
+   if (await sharedPrimaryRoute(key)) {
+-    applyActive(g.primaryProfile, activationEpoch)
++    applyActive(g.primaryProfile, activationEpoch, key)
+ 
+     return
+   }
+diff --git a/apps/desktop/src/store/profile-select-webapp-served.test.ts b/apps/desktop/src/store/profile-select-webapp-served.test.ts
+index b1b8009b9b..b6f0373e65 100644
+--- a/apps/desktop/src/store/profile-select-webapp-served.test.ts
++++ b/apps/desktop/src/store/profile-select-webapp-served.test.ts
+@@ -106,7 +106,10 @@ describe('selecting a profile in a Webapp tab', () => {
+ 
+     expect(sockets).toHaveLength(built)
+     expect($gateway.get()).toBe(primary)
+-    expect(activeGatewayProfileKey()).toBe('default')
++    // The rider publishes the profile it SERVES (fresh), not the primary's own
++    // name: consumers mirror this into $activeGatewayProfile, and a 'default'
++    // here is the state that made the sidebar reload the wrong profile's list.
++    expect(activeGatewayProfileKey()).toBe('fresh')
+     expect($activeGatewayProfile.get()).toBe('fresh')
+     expect($connection.get()).toMatchObject({ profile: 'fresh', sharedPrimary: true })
+   })
+diff --git a/apps/desktop/src/store/profile-switch-barrier.test.ts b/apps/desktop/src/store/profile-switch-barrier.test.ts
+new file mode 100644
+index 0000000000..a4b38761f0
+--- /dev/null
++++ b/apps/desktop/src/store/profile-switch-barrier.test.ts
+@@ -0,0 +1,130 @@
++import { atom } from 'nanostores'
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++
++// The gateway socket layer must not run for real: a profile pick's activation
++// is the thing under test, and it is driven to whatever state each case needs.
++const ensureGatewayForProfile = vi.fn(async (_profile: string) => undefined)
++const ensureGatewayForAgent = vi.fn(async (_connectionId: string, _profile: string) => undefined)
++const openGatewayForProfile = vi.fn(async (_profile: string) => undefined)
++const openGatewayForAgent = vi.fn(async (_connectionId: null | string, _profile: string) => undefined)
++const activeGatewayConnectionId = vi.fn((): null | string => null)
++const $gateway = atom<unknown>({ id: 'live-socket', connectionState: 'open' })
++
++vi.mock('@/store/gateway', () => ({
++  $gateway,
++  activeGateway: () => null,
++  activeGatewayConnectionId,
++  activeGatewayProfileKey: () => ensureGatewayForProfile.mock.lastCall?.[0] ?? null,
++  ensureGatewayForAgent,
++  ensureGatewayForProfile,
++  openGatewayForAgent,
++  openGatewayForProfile,
++  openSecondaryCount: () => 0
++}))
++vi.mock('@/hermes', () => ({
++  getProfiles: vi.fn(async () => ({ profiles: [] })),
++  setApiRequestProfile: vi.fn()
++}))
++vi.mock('@/lib/query-client', () => ({ invalidateProfileScopedQueries: vi.fn() }))
++vi.mock('@/store/starmap', () => ({ reloadOpenStarmapGraph: vi.fn(), resetStarmapGraph: vi.fn() }))
++// The failure path toasts; the real store reaches for window timers, which the
++// stub below (hermesDesktop only) does not provide.
++vi.mock('@/store/notifications', () => ({ notify: vi.fn(), notifyError: vi.fn() }))
++
++const { $activeGatewayProfile, $profileSwitchTarget, selectProfile } = await import('./profile')
++// Importing this module registers the sidebar-only wipe bridge (the profile
++// store deliberately does not import it back — that would close a cycle).
++const { registerGatewaySwitchLifecycle } = await import('./gateway-switch')
++const { $sessions, $sessionsLoading, setSessions } = await import('./session')
++
++const row = (id: string) => ({ id, profile: 'default', source: 'desktop', title: id }) as never
++
++beforeEach(() => {
++  ensureGatewayForProfile.mockReset()
++  ensureGatewayForProfile.mockResolvedValue(undefined)
++  $gateway.set({ id: 'live-socket', connectionState: 'open' })
++  $activeGatewayProfile.set('default')
++  $profileSwitchTarget.set(null)
++  $sessionsLoading.set(false)
++  vi.stubGlobal('window', { hermesDesktop: { getConnection: vi.fn(async () => ({ mode: 'local', profile: 'default' })) } })
++})
++
++afterEach(() => {
++  vi.unstubAllGlobals()
++  setSessions([])
++})
++
++describe('profile pick enters the switch state before dialing', () => {
++  it('drops the outgoing rows, arms the skeleton and marks the target synchronously', async () => {
++    // Activation parked: the real dial is a multi-second `hermes gateway ensure`
++    // spawn, so the interesting frame is the one BEFORE it settles. Released
++    // before the case ends — ensureGatewayProfile serializes switches behind
++    // that promise, and a case that leaves it hanging wedges every later one.
++    let release!: () => void
++    ensureGatewayForProfile.mockImplementation(
++      () => new Promise<undefined>(resolve => {
++        release = () => resolve(undefined)
++      })
++    )
++    setSessions([row('old-1'), row('old-2')])
++    $sessionsLoading.set(false)
++
++    selectProfile('work')
++
++    // Synchronous, same tick as the click — no await between pick and wipe.
++    expect($profileSwitchTarget.get()).toBe('work')
++    expect($sessions.get()).toHaveLength(0)
++    expect($sessionsLoading.get()).toBe(true)
++
++    // The dial is reached on a later microtask (the module awaits the served-
++    // profile refresh first); wait for it, then let it settle.
++    await vi.waitFor(() => {
++      expect(typeof release).toBe('function')
++    })
++    release()
++    await vi.waitFor(() => {
++      expect($profileSwitchTarget.get()).toBeNull()
++    })
++  })
++
++  it('does not enter the switch state when the picked profile is already active', () => {
++    setSessions([row('keep-1')])
++
++    selectProfile('default')
++
++    expect($profileSwitchTarget.get()).toBeNull()
++    expect($sessions.get()).toHaveLength(1)
++    expect($sessionsLoading.get()).toBe(false)
++  })
++
++  it('repaints the still-active source and clears the target when the dial fails', async () => {
++    const refreshSessions = vi.fn(async () => undefined)
++    registerGatewaySwitchLifecycle({ beforeConnectionSwitch: vi.fn(), refreshSessions })
++    ensureGatewayForProfile.mockRejectedValue(new Error('backend unreachable'))
++    setSessions([row('old-1')])
++
++    selectProfile('work')
++
++    // Settle the activation promise chain.
++    await vi.waitFor(() => {
++      expect($profileSwitchTarget.get()).toBeNull()
++    })
++
++    expect(refreshSessions).toHaveBeenCalled()
++    expect($sessionsLoading.get()).toBe(false)
++    // The pill stays on the profile that is still served (#81094).
++    expect($activeGatewayProfile.get()).toBe('default')
++  })
++
++  it('clears the target after a successful dial', async () => {
++    setSessions([row('old-1')])
++
++    selectProfile('work')
++
++    await vi.waitFor(() => {
++      expect($profileSwitchTarget.get()).toBeNull()
++    })
++
++    expect(ensureGatewayForProfile).toHaveBeenCalledWith('work')
++  })
++})
+diff --git a/apps/desktop/src/store/profile.ts b/apps/desktop/src/store/profile.ts
+index c3b3d82088..bac2486270 100644
+--- a/apps/desktop/src/store/profile.ts
++++ b/apps/desktop/src/store/profile.ts
+@@ -488,6 +488,45 @@ $activeGatewayProfile.subscribe(value => {
+ // so a lazy spawn doesn't read as a hang. Single-profile users never swap.
+ export const $gatewaySwapTarget = atom<string | null>(null)
+ 
++// Target profile while a PROFILE PICK is dialing, else null. Set synchronously
++// by selectProfile — before the activation round-trip — so the rail can show a
++// spinner on the picked profile for the whole dial instead of leaving the
++// click looking inert. $gatewaySwapTarget is not sufficient for that: it is
++// published inside ensureGatewayProfile only after the fast-path checks, and
++// an already-active target never sets it at all.
++export const $profileSwitchTarget = atom<string | null>(null)
++
++/**
++ * The profile-switch handshake: `selectProfile` must wipe the sidebar's
++ * outgoing-profile rows SYNCHRONOUSLY, before dialing the target backend, or
++ * those rows stay painted and clickable for the whole round-trip — a cold
++ * local dial costs 4–8 s of `hermes gateway ensure`, and clicking a row in
++ * that window resumes the WRONG profile's session.
++ *
++ * Registered rather than imported: `store/gateway-switch.ts` already imports
++ * this module (`invalidateProfileListFetches`), so importing it back would
++ * close a cycle. gateway-switch.ts registers itself at module scope, the safe
++ * direction.
++ */
++interface ProfileSwitchBridge {
++  /** Wipe the sidebar's session lists and arm the skeleton. */
++  begin: () => void
++  /** Repaint the still-active source after a failed switch. */
++  recover: () => void
++}
++
++let profileSwitchBridge: ProfileSwitchBridge | null = null
++
++export function registerProfileSwitchBridge(bridge: ProfileSwitchBridge): () => void {
++  profileSwitchBridge = bridge
++
++  return () => {
++    if (profileSwitchBridge === bridge) {
++      profileSwitchBridge = null
++    }
++  }
++}
++
+ // Profile whose wake resolved PAINT-FIRST while the active-profile gate was
+ // still unsatisfied (#89843): on a shared-remote connection every profile is
+ // legitimately served through the primary socket, so $activeGatewayProfile
+@@ -988,7 +1027,16 @@ export function selectProfile(name: string): void {
+   // legacy profile-only path when that is the door the pick takes.
+   captureNewChatSource(profilePickConnectionId(target))
+ 
++  // Enter the switch state SYNCHRONOUSLY, before the activation round-trip: the
++  // sidebar drops the outgoing profile's rows (and shows skeletons) now, so the
++  // 4–8 s `hermes gateway ensure` dial cannot present a working-looking but
++  // wrong session list that resumes the previous profile's sessions.
++  let ownsSwitchState = false
++
+   if (switching) {
++    $profileSwitchTarget.set(target)
++    profileSwitchBridge?.begin()
++    ownsSwitchState = true
+     leaveForeignProjectScope(target)
+     requestFreshSession()
+   }
+@@ -1015,10 +1063,22 @@ export function selectProfile(name: string): void {
+       return undefined
+     })
+     .catch((error: unknown) => {
++      // The wipe left the lists empty and the skeleton armed, and a FAILED
++      // switch moves no scope, so nothing reactive re-pulls them: repaint the
++      // still-active source or the sidebar sits on skeletons forever.
++      if (switching) {
++        profileSwitchBridge?.recover()
++      }
++
+       if (!notifyRemoteOverrideAuthFailure(target, error)) {
+         notifyError(error, `Failed to switch to profile "${target}"`)
+       }
+     })
++    .finally(() => {
++      if (ownsSwitchState && $profileSwitchTarget.get() === target) {
++        $profileSwitchTarget.set(null)
++      }
++    })
+ }
+ 
+ // Whether a pick becomes the profile this window starts in next time.
+diff --git a/apps/desktop/src/store/projects.ts b/apps/desktop/src/store/projects.ts
+index 1ffb2687ac..3f85ca8c9a 100644
+--- a/apps/desktop/src/store/projects.ts
++++ b/apps/desktop/src/store/projects.ts
+@@ -575,6 +575,21 @@ async function refreshProjectTreeOn(context: ActiveProjectsContext): Promise<voi
+ // Pull the authoritative project tree (overview structure + counts + preview
+ // sessions + the scoped-session-id set). Best-effort: a failure leaves the
+ // cached tree intact so the sidebar doesn't flicker.
++/**
++ * A PROFILE PICK swaps the backend behind `projects.*`: every project, lane and
++ * hydrated session row this renderer holds belongs to the profile being left
++ * (they are separate projects.db files). Drop them NOW — the grouped sidebar
++ * paints those rows straight off $projectTree, so keeping them through the dial
++ * shows the outgoing profile's sessions until the new tree loads, which is
++ * exactly the "old rows for a few seconds then it flips" report. The scope-move
++ * refresh re-pulls the new profile's overview.
++ */
++export function resetProjectsForProfileSwitch(): void {
++  $projects.set([])
++  $projectTree.set([])
++  $activeProjectId.set(null)
++}
++
+ export async function refreshProjectTree(): Promise<void> {
+   if (viewingAllProfiles()) {
+     await refreshProjectTreeAcrossProfiles()
+diff --git a/apps/desktop/src/store/reactions-local.test.ts b/apps/desktop/src/store/reactions-local.test.ts
+index e97fe1fe95..1aa606faa9 100644
+--- a/apps/desktop/src/store/reactions-local.test.ts
++++ b/apps/desktop/src/store/reactions-local.test.ts
+@@ -22,6 +22,8 @@ vi.mock('@/store/profile', async () => {
+   return {
+     $activeGatewayProfile: nanoAtom('default'),
+     invalidateProfileListFetches: vi.fn(),
++    // gateway-switch registers its profile-pick bridge at module scope.
++    registerProfileSwitchBridge: vi.fn(() => () => undefined),
+     normalizeProfileKey: (value: string | null | undefined) => (value ?? '').trim() || 'default'
+   }
+ })
+-- 
+2.53.0.windows.3
+
