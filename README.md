@@ -61,6 +61,14 @@ Same machine, same pair of profiles (50 rows vs 29 rows, so the swap is visible)
 One commit, 22 files, +664/−50 — three independent fixes, described in detail in
 [`docs/root-cause.md`](docs/root-cause.md):
 
+> **Rebaselined 2026-11-19 against `95a1d228c5`.** The first rebase target was `2026-11-14`; upstream since
+> renamed the sidebar's profile helper to `sidebarFetchProfile()` (Bot Mode reads a bot's fetch profile) and
+> moved the switch wipe into `wipeSessionListsForGatewaySwitch()`. The patch was re-cut on the new names:
+> the live-scope compare and `owns()` now go through `sidebarFetchProfile()`, the switch-target compare still
+> goes through `sidebarProfileForScope()` (a profile pick names a scope, not a bot). Verified on that HEAD:
+> `tsc --noEmit` clean, 1608/1609 desktop tests green (the single red is the pre-existing
+> `prepared-submissions` storage-key count, unrelated to this patch), `npm run build` OK.
+
 1. **Switch barrier** — `apps/desktop/src/store/gateway-switch.ts` gains `beginProfileSwitch()`: it wipes
    `$sessions` / `$cronSessions` / `$messagingSessions`, arms `$sessionsLoading`, and resets the project tree,
    synchronously at pick time, before the dial starts. `apps/desktop/src/store/profile.ts` `selectProfile()`
